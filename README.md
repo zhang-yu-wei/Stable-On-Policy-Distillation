@@ -1,4 +1,4 @@
-# On-Policy Distillation (OPD) Failure Modes — Paper Collection
+# Stablize On-Policy Distillation (OPD) — Paper Collection
 
 A curated collection of recent papers investigating failure modes and stabilization mechanisms in On-Policy Distillation for LLMs. Papers are organized into three thematic categories.
 
