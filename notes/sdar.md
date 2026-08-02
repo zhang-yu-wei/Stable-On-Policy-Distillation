@@ -79,7 +79,7 @@ The total training objective is:
 L_total = L_GRPO + λ · L_gated_OPSD
 ```
 
-Important design choice: GRPO remains the backbone. OPSD is not allowed to dominate training; it only adds token-level help where the gate decides the teacher signal is useful.
+Important design choice: GRPO remains the base algorithm. OPSD is not allowed to dominate training; it only adds token-level help where the gate decides the teacher signal is useful.
 
 ## Empirical Claim
 

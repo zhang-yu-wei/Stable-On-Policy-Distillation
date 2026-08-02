@@ -4,7 +4,7 @@ Source sweep: 2026-06-15
 
 ## One-line Summary
 
-There is now a clear cluster of papers applying self-distillation, context distillation, hindsight feedback, or skill-conditioned teachers to multi-turn agent RL. The common recipe is:
+There is now a clear cluster of papers applying self-distillation, context distillation, hindsight feedback, or skill-conditioned teachers to multi-turn agent RL. The common procedure is:
 
 ```
 trajectory reward -> coarse update direction
@@ -32,7 +32,7 @@ The important design axis is not just "distill or not." It is **where the privil
 
 | Paper | Local PDF | Main Idea | Granularity |
 | --- | --- | --- | --- |
-| **Self-Distilled Agentic Reinforcement Learning (SDAR)** | `papers/opd_rl_connection_and_reward/SDAR_Self_Distilled_Agentic_RL.pdf` | Keeps GRPO as the backbone and adds gated OPSD from a skill-conditioned self-teacher. Positive teacher-student gaps are trusted more than negative rejections. | Trajectory-level reward; token-level gated distillation; task/trajectory-level skill retrieval. |
+| **Self-Distilled Agentic Reinforcement Learning (SDAR)** | `papers/opd_rl_connection_and_reward/SDAR_Self_Distilled_Agentic_RL.pdf` | Keeps GRPO as the base algorithm and adds gated OPSD from a skill-conditioned self-teacher. Positive teacher-student gaps are trusted more than negative rejections. | Trajectory-level reward; token-level gated distillation; task/trajectory-level skill retrieval. |
 | **Skill-SD: Skill-Conditioned Self-Distillation for Multi-turn LLM Agents** | `papers/agentic_self_distillation/Skill_SD_Skill_Conditioned_Self_Distillation.pdf` | Converts completed trajectories into compact skills describing successful behaviors, mistakes, and workflows. The teacher sees retrieved skills; the student acts under the plain prompt and internalizes guidance via distillation. | Trajectory-derived skills; token-level teacher-student distillation. |
 | **Privileged Information Distillation for Language Models** | `papers/agentic_self_distillation/PI_Distill_Privileged_Information_Distillation.pdf` | Studies PI-conditioned teacher and unconditioned student training for multi-turn agentic environments; introduces pi-Distill and OPSD-style reverse-KL training with privileged information. | PI-conditioned teacher; student acts without PI. |
 | **TCOD: Temporal Curriculum OPD for Multi-turn Autonomous Agents** | `papers/agentic_self_distillation/TCOD_Temporal_Curriculum_OPD.pdf` | Diagnoses trajectory-level KL instability in multi-turn OPD caused by inter-turn error compounding. Uses a curriculum that exposes the student to short depths first, then progressively longer trajectories. | Curriculum over trajectory depth; stabilizes multi-turn distillation. |
