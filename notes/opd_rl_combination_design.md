@@ -3,7 +3,8 @@
 Consolidates the combination-space analysis: where a teacher can enter a
 policy-gradient method, what each entry point does to the fixed point, the
 closed-form optimum and its risks, how to compute the teacher potential,
-and how the coupling weight is chosen and decayed in practice. Companions:
+how the coupling weight is chosen and decayed in practice, and where one
+shipped implementation lands in the taxonomy. Companions:
 `ppo_opd_value_bridge.md` (the Combination Space section there is the
 compressed version of Sections 1–5; eqs. (C1)–(C3) correspond to (1), (3),
 (4) here), `soft_rl_textbook_primer.md` (the Gibbs lemma), and
@@ -30,7 +31,8 @@ The additive form $L_{\mathrm{RL}} + \lambda\,L_{\mathrm{OPD}}$, common in
 the literature, is a blurred version of slot 1: two gradients coupled at an
 arbitrary exchange rate, with no closed-form optimum and (as the survey
 note's opening observes) no good equilibrium — which is why every additive
-paper ends up scheduling $\lambda$ to zero (Section 7).
+paper ends up scheduling $\lambda$ to zero (Section 7). Section 8 classifies
+one shipped implementation, slime's, against these three slots.
 
 ## 2. Slot 1: the KL-regularized objective and its optimum
 
@@ -343,7 +345,292 @@ coefficient by the sign of batch-mean drift — dual ascent in crude form.
 $\beta_S\to0$ makes teacher influence transient by fiat — a
 schedule-imposed imitation of the property slot 2 has by construction.
 
-## 8. Recommendation
+## 8. A shipped implementation classified: slime's OPD
+
+slime's on-policy distillation (upstream commit `680824dd`; identical math
+in the `miles` rename, `miles/backends/training_utils/loss_hub/opd.py`) is
+slot 1 in the additive form. Worth recording because the surface
+resemblance to Section 4's GRPO instantiation is close — both add per-token
+structure to credit that GRPO otherwise leaves flat — while the fixed-point
+properties are opposite.
+
+**What it computes.** `apply_opd_kl_to_advantages`
+(`slime/backends/megatron_utils/loss.py:620`) runs *after* the base
+estimator has produced advantages, and modifies them in place:
+
+$$
+\hat A_t \;=\; A_t \;-\; \lambda_{\mathrm{opd}}
+\big[\log\pi_\theta(y_t\mid s_t)-\log\pi_T(y_t\mid s_t)\big],
+\tag{5}
+$$
+
+with $\lambda_{\mathrm{opd}}=$ `--opd-kl-coef`, $\pi_\theta$ the current
+student from the no-grad forward pass, and $\pi_T$ the teacher scored on
+the same sampled tokens — obtained either from an external SGLang server
+during rollout (`--opd-type sglang`) or from a Megatron-resident teacher
+forward (`--opd-type megatron`). The bracket is the $k_1$ estimator of the
+per-token reverse KL. Under GRPO the incoming $A_t$ is the group-normalized
+scalar broadcast flat across the whole response (`get_grpo_returns`,
+`slime/utils/ppo_utils.py:368`), so (5) supplies the only per-token
+variation in credit — which is what invites the comparison with slot 2.
+
+**The gradient it produces.** The classification runs through the gradient,
+so write the loss out. slime never touches the loss function; it modifies
+the advantage tensor the loss consumes. That loss
+(`slime/utils/ppo_utils.py:132`, reduced per rollout as a token mean at
+`loss.py:1044`) is
+
+$$
+L(\theta)=\mathbb E\Big[\tfrac1{|y|}\textstyle\sum_t
+\max\big(-r_t\hat A_t,\;-\mathrm{clip}(r_t,1-\epsilon,1+\epsilon_{\mathrm{hi}})\hat A_t\big)\Big]
+-c_H H+c_{\mathrm{KL}}\mathrm{KL}(\pi_\theta\Vert\pi_{\mathrm{ref}}),
+\tag{7}
+$$
+
+with $r_t=\pi_\theta(y_t\mid s_t)/\pi_{\mathrm{old}}(y_t\mid s_t)$. Run
+on-policy — one gradient step per rollout batch — $r_t=1$ identically at the
+point of evaluation and the clip is inactive, so substituting (5),
+
+$$
+\nabla_\theta L=-\,\mathbb E\Big[\tfrac1{|y|}\textstyle\sum_t
+\big(A_t-\lambda_{\mathrm{opd}}k_t\big)\nabla_\theta\log\pi_\theta(y_t\mid s_t)\Big],
+\qquad
+k_t=\log\frac{\pi_\theta^{\mathrm{sg}}(y_t\mid s_t)}{\pi_T(y_t\mid s_t)},
+\tag{8}
+$$
+
+where $\mathrm{sg}$ marks the value from the no-grad forward pass, a
+constant inside the loss.
+
+### 8.1 Why this is slot 1
+
+**(a) The teacher term is the gradient of a KL.** Fix a state $s$ and
+differentiate the per-state reverse KL, using $\sum_a\nabla\pi_\theta(a\mid s)=\nabla1=0$
+to kill the pass-through part:
+
+$$
+\nabla_\theta\,\mathrm{KL}\big(\pi_\theta(\cdot\mid s)\Vert\pi_T(\cdot\mid s)\big)
+=\sum_a\nabla\pi_\theta(a\mid s)\Big[\log\tfrac{\pi_\theta(a\mid s)}{\pi_T(a\mid s)}+1\Big]
+=\mathbb E_{a\sim\pi_\theta}\big[k(s,a)\,\nabla_\theta\log\pi_\theta(a\mid s)\big].
+\tag{9}
+$$
+
+The right-hand side is exactly the $\lambda_{\mathrm{opd}}k_t$ term of (8),
+with the sampled token supplying the expectation. So the update ascends
+
+$$
+J_{\mathrm{slime}}(\theta)=\mathbb E_{\pi_\theta}[R]
+-\lambda_{\mathrm{opd}}\,\mathbb E_{\pi_\theta}\Big[\tfrac1{|y|}\textstyle\sum_t
+\mathrm{KL}\big(\pi_\theta(\cdot\mid s_t)\Vert\pi_T(\cdot\mid s_t)\big)\Big],
+\tag{10}
+$$
+
+which is (1) with $\beta_S=\lambda_{\mathrm{opd}}$, up to the two deviations
+below. A teacher inside the objective is the definition of slot 1. Note the
+converse also holds and is worth stating: because the pass-through term
+vanishes, the sampled-token value $k_t$ is a *sufficient* statistic — the
+teacher's full distribution is never needed, which is what allows the
+teacher to be a remote server returning only sampled-token log-probs.
+
+*Deviation 1 — the visitation term.* Identity (9) holds the state
+distribution fixed. The exact gradient of (10) also carries
+$\sum_s\nabla_\theta d_\theta(s)\,\mathrm{KL}(s)$, the policy's effect on
+which states are visited. slime drops it: in (8) each $k_t$ pairs only with
+$\nabla\log\pi_\theta(y_t\mid s_t)$, never with the prefix, so token $t$'s
+teacher disagreement never reaches token $t-1$'s credit. This is the
+$\gamma=0$ choice, and it is what separates slime from eq. (4), which puts
+the log-ratio into the *reward stream* ahead of the estimator so that it
+enters every earlier position's return-to-go. The consequence for the fixed
+point is that the per-state optimum is the tilt
+
+$$
+\pi^\star(a\mid s)\;\propto\;\pi_T(a\mid s)\,e^{A(s,a)/\lambda_{\mathrm{opd}}},
+\tag{11}
+$$
+
+the local form of (3); the visitation-weighted global optimum differs from
+(3) by the dropped term. What does not change is the structural fact: the
+teacher sits in the fixed point, so Section 3's veto bound applies — behavior
+the teacher downweights by more than $\Delta R/\lambda_{\mathrm{opd}}$ nats
+cannot be lifted into the optimum by any amount of reward evidence, which at
+slime's default $\lambda_{\mathrm{opd}}=1.0$ with binary reward is one nat.
+
+*Deviation 2 — length normalization.* (7) reduces by a per-rollout token
+**mean**, not a sum, so the KL contribution stays $O(1)$ against $R$ whatever
+the length. Section 3's first balancing mechanism (a per-token KL sum growing
+against an $O(1)$ reward) therefore does not apply to slime as written. The
+density-mismatch and nonstationarity mechanisms still do.
+
+**(b) The baseline test, which slot 2 passes and (5) fails.** Slot 2's
+per-token term $\tilde\Phi_t=\sum_{j<t}g_j$ is $\sigma(s_t)$-measurable — it
+is built from tokens strictly before $t$ — so it factors out of the
+inner expectation and the baseline lemma applies:
+
+$$
+\mathbb E_{y_t\sim\pi_\theta(\cdot\mid s_t)}\big[\tilde\Phi_t\,\nabla_\theta\log\pi_\theta(y_t\mid s_t)\big]
+=\tilde\Phi_t\,\mathbb E\big[\nabla_\theta\log\pi_\theta(y_t\mid s_t)\big]=0 .
+\tag{12}
+$$
+
+Variance changes, the expected gradient does not — unbiased for *any*
+teacher. slime's $k_t$ is a function of the sampled $y_t$, so it does not
+factor out, and by (9) its contribution is not zero but $\nabla\mathrm{KL}$.
+This is the entire difference, and it turns on *which arguments the term
+takes*, not on which models produce it.
+
+**(c) The potential test.** Potential-based shaping requires a single
+function $\Phi$ of state, with $\Phi\equiv0$ at terminals, contributing
+$\Phi(s_{t+1})-\Phi(s_t)$ per step (Section 4). Ask whether (5)'s term has
+that form. The token MDP is a tree, so every state has a unique history and
+integration along it always produces a candidate:
+
+$$
+\Phi(s_t)=\Phi(x)+\lambda_{\mathrm{opd}}\sum_{j<t}\log\frac{\pi_T(y_j\mid s_j)}{\pi_\theta(y_j\mid s_j)} .
+$$
+
+Path-independence is therefore vacuous here and cannot be the discriminator.
+The terminal condition is. Imposing $\Phi(s_T)=0$ forces
+
+$$
+\Phi(x)=-\lambda_{\mathrm{opd}}\sum_{j<T}\log\frac{\pi_T(y_j\mid s_j)}{\pi_\theta(y_j\mid s_j)},
+\tag{13}
+$$
+
+whose right side depends on the completion $y$ while the left must be one
+number per prompt. No such $\Phi$ exists unless the total log-ratio is
+identical across all completions of $x$. So (5) is not potential-based
+shaping, and Section 4's invariance theorem does not reach it.
+
+The failure is substantive, not technical. The total credit (5) adds along a
+completion is $-\lambda_{\mathrm{opd}}$ times that completion's
+sequence-level KL estimate, which *varies across completions* and therefore
+re-ranks them: completions the teacher finds probable gain. A potential adds
+the same total to every completion of a prompt, which is exactly why it
+cannot re-rank. That is (b) again, stated over whole sequences instead of
+single tokens.
+
+**(d) Where the frozen-reference question does and does not enter.** Using
+the bridge note's Step-2 decomposition against any frozen
+$\pi_{\mathrm{ref}}$,
+
+$$
+\log\frac{\pi_T(y_t\mid s_t)}{\pi_\theta(y_t\mid s_t)}
+=\underbrace{\log\frac{\pi_T(y_t\mid s_t)}{\pi_{\mathrm{ref}}(y_t\mid s_t)}}_{g_t/\beta}
++\underbrace{\log\frac{\pi_{\mathrm{ref}}(y_t\mid s_t)}{\pi_\theta(y_t\mid s_t)}}_{\text{drift}} .
+\tag{14}
+$$
+
+Within one iteration $k_t$ is a frozen constant, and in on-policy
+single-step operation $\pi_\theta$ *is* the sampling policy — so (8) is a
+faithful implementation of (10), not a broken implementation of slot 2. At
+initialization with $\pi_{\mathrm{ref}}=\pi_{\theta_0}$ the drift term
+vanishes and slime's per-token term coincides numerically with the potential
+increment $g_t/\beta$. The coincidence ends immediately: slot 2 freezes the
+reference *across* iterations, slime re-reads it every iteration, and the
+accumulated drift is what Step 2 identifies as the non-conservative
+component.
+
+Two things are independent of all this. First, tests (b) and (c) already
+fail at $\theta=\theta_0$, where the drift is exactly zero — they concern
+aggregation and the terminal condition, not the denominator. Second, the
+sign: substituting $\pi_\theta=\pi_{\mathrm{ref}}$ into (5) gives
+$\hat A_t=A_t+(\lambda_{\mathrm{opd}}/\beta)\,g_t$, the increment *added* to
+an advantage that already contains the terminal reward, where slot 2
+*subtracts* the accumulated $\tilde\Phi_t$ from the return. Adding $g_t$ on
+top of $R$ is the one configuration Section 4's closing caution rules out:
+for an accurate teacher the final increment already contains $R$, so the
+outcome is counted twice.
+
+### 8.2 Summary of the differences
+
+| | slot 2 (Section 4) | slime, eq. (5) |
+|---|---|---|
+| argument of the term | the prefix $s_t$ alone | the sampled token $y_t$ |
+| aggregation | prefix sum $\tilde\Phi_t=\sum_{j<t}g_j$ | current token only |
+| combination | subtracted from the return $R$ | added to the finished advantage |
+| model pair | $\pi_T$ vs $\pi_{\mathrm{ref}}$, frozen across iterations | $\pi_T$ vs $\pi_\theta$, re-read each iteration |
+| expected gradient contribution | zero, by (12) | $\nabla\mathrm{KL}$, by (9) |
+| fixed point | unchanged | tilted, eq. (11) |
+
+Rows one and two are decisive and hold unconditionally; row four only
+compounds them over training.
+
+### 8.3 Two implementation details with theoretical weight
+
+1. *Whitening order.* (5) is applied before `normalize_advantages`
+   (`loss.py:778`). With whitening on, the RL part and the KL part are
+   divided by the same batch standard deviation, so $\lambda_{\mathrm{opd}}$
+   is not a stable exchange rate between them — it drifts with batch
+   statistics. This is the concrete form of Section 3's observation that
+   global whitening cannot repair a per-signal imbalance.
+2. *No schedule.* `opd_kl_coef` is a plain float
+   (`slime/utils/arguments.py:1130`), read at one site and never written;
+   the repository contains no annealing, gating, or dual-ascent controller
+   for it, and the argument validation does not bound it. Measured against
+   Section 7, slime implements the additive slot-1 objective without the
+   decay that every additive method in the survey found necessary — which
+   is the configuration Section 9's diagnostic principle argues against.
+
+A separate slot-1 channel exists alongside it: `--kl-coef` against the
+reference model (`loss.py:700-715`), which *is* folded into the reward
+stream before the estimator on the PPO and REINFORCE++ paths. So the
+machinery for the eq. (4) form is present in the codebase; OPD does not
+use it.
+
+### 8.4 What migration to slot 2 would require
+
+The target, from Section 4's GRPO instantiation:
+
+$$
+g_{i,t}=\beta\big[\log\pi_T(y_{i,t}\mid s_{i,t})-\log\pi_{\mathrm{ref}}(y_{i,t}\mid s_{i,t})\big],
+\qquad
+\hat A_{i,t}=R_i-\sum_{j<t}g_{i,j},
+\tag{15}
+$$
+
+then standardize within the group. Three substantive changes: swap
+$\pi_\theta$ for a frozen $\pi_{\mathrm{ref}}$, accumulate prefix sums, and
+subtract from the return rather than add to the advantage. Also required:
+the real verifier reward must be restored, since the shipped sglang path
+returns $0.0$ for every sample (`on_policy_distillation.py:65`) on the
+premise that the KL carries the whole signal — slot 2 keeps $R$ and changes
+only credit assignment. And `--use-opd` must be off, by (d)'s
+double-counting argument.
+
+Two placement constraints decide where the computation goes, and both point
+away from the training step:
+
+- *The prefix sum against context parallelism.* Under CP each rank holds two
+  non-contiguous chunks of the sequence (`cp_utils.py:9-44`), so an
+  exclusive scan along the response needs a two-phase scan across the CP
+  group. Computing $\tilde\Phi$ on the whole sequence at rollout side avoids
+  this: per-token tensors arriving from rollout are already sharded
+  correctly by `slice_log_prob_with_cp` (`actor.py:261-276`).
+- *Group standardization.* DP partitioning can split a group across ranks,
+  which is why slime normalizes rewards at rollout side
+  (`ray/rollout.py:664-687`) rather than in the loss. At rollout
+  post-process time the group is intact.
+
+So the natural implementation computes $g$, $\tilde\Phi$ and the
+standardized $\hat A$ in a `--custom-reward-post-process-path` function,
+ships the finished per-token advantage through a new `Sample` field
+(five one-line plumbing edits mirroring `teacher_log_probs`), and reads it
+in a `--custom-advantage-function-path` function that replaces the estimator
+branch at `loss.py:717-720`. Nothing in the loss changes. The second
+scoring pass against $\pi_{\mathrm{ref}}$ can reuse the multi-model serving
+already present (`get_model_url(args, "ref", "/generate")`,
+`sglang_rollout.py:65-81`). The Megatron-resident alternative needs no extra
+served model but must implement the CP scan, and additionally patch
+`placement_group.py:178`, where ref residency is currently gated on
+`kl_coef != 0 or use_kl_loss`.
+
+Two choices the code cannot make: $\beta$, the teacher's temperature,
+setting the scale of $\tilde\Phi$ against $R$; and which reference — the
+teacher's own pre-RL checkpoint makes the log-ratio the teacher's RL delta,
+while the student init is the documented fallback that records
+teacher-vs-init capability gaps as value.
+
+## 9. Recommendation
 
 - Prefer slots 2 (+3) as the primary channels: invariant, transient under
   data, nothing to balance. This is the bridge note's design.
